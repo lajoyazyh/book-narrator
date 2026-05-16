@@ -1,0 +1,149 @@
+# src/tools/langchain_tools.py
+
+from typing import Any
+
+from langchain_core.tools import tool
+
+from src.tools.book_loader import extract_pdf_text, get_pdf_page_count
+from src.tools.narrator import NarratorTool
+from src.tools.audio_generator import AudioGenerator
+from src.tools.todo import TodoManager, TodoItem
+
+
+def get_all_tools(context: dict) -> list:
+    """
+    返回 LangChain Agent 可用工具。
+    """
+
+    todo_manager = TodoManager()
+
+    @tool
+    def read_pdf_pages(file_path: str, start_page: int = 1, end_page: int = 3) -> str:
+        """
+        读取 PDF 指定页码范围的文本。
+
+        参数：
+        - file_path: PDF 文件路径。可以是绝对路径，也可以是 shared/books 中的文件名。
+          例如：/Users/xuzutang/Desktop/shared/books/xxx.pdf
+        - start_page: 开始页，页码从 1 开始。
+        - end_page: 结束页。
+
+        当用户请求中包含“PDF 文件路径”时，应优先调用本工具读取 PDF。
+        """
+        text = extract_pdf_text(
+            file_path=file_path,
+            start_page=start_page,
+            end_page=end_page,
+        )
+
+        context["last_pdf_path"] = file_path
+        context["last_pdf_text"] = text
+        context.setdefault("tool_calls", []).append(
+            {
+                "tool_name": "read_pdf_pages",
+                "input_data": {
+                    "file_path": file_path,
+                    "start_page": start_page,
+                    "end_page": end_page,
+                },
+                "output_data": {
+                    "text_preview": text[:300],
+                    "length": len(text),
+                },
+            }
+        )
+
+        return text
+
+    @tool
+    def get_pdf_pages(file_path: str) -> str:
+        """
+        获取 PDF 总页数。
+
+        参数：
+        - file_path: PDF 文件路径。可以是绝对路径，也可以是 shared/books 中的文件名。
+        """
+        pages = get_pdf_page_count(file_path)
+        return f"PDF 总页数：{pages}"
+
+    @tool
+    def generate_narration(content: str, title: str = "", style: str = "短视频", voice: str = "Ava", task_instruction: str = "") -> str:
+        """
+        根据文本内容生成书籍解说词。
+
+        参数：
+        - content: 从 PDF 中读取到的正文内容。
+        - title: 书名或章节标题。
+        - style: 解说风格，例如 短视频、睡前故事、电影解说。
+        """
+        narrator = NarratorTool(style=style)
+        result = narrator.generate(
+            content=content,
+            title=title,
+            style=style,
+        )
+
+        context["last_narration"] = result
+        context.setdefault("tool_calls", []).append(
+            {
+                "tool_name": "generate_narration",
+                "input_data": {
+                    "title": title,
+                    "style": style,
+                    "content_preview": content[:300],
+                },
+                "output_data": {
+                    "result_preview": result[:300],
+                    "length": len(result),
+                },
+            }
+        )
+
+        return result
+
+    @tool
+    def generate_audio(text: str, filename: str = "narration.txt", voice: str = "晓晓") -> str:
+        """
+        将解说词生成音频 MP3。
+
+        参数：
+        - text: 解说词文本。
+        - filename: 文件名，建议以 .txt 结尾。
+        - voice: 声音，例如 晓晓、云希、云扬、晓伊。
+        """
+        generator = AudioGenerator(voice=voice)
+        audio_path = generator.generate(text=text, filename=filename)
+
+        context["last_audio_file"] = audio_path
+        context.setdefault("tool_calls", []).append(
+            {
+                "tool_name": "generate_audio",
+                "input_data": {
+                    "filename": filename,
+                    "voice": voice,
+                },
+                "output_data": {
+                    "audio_path": audio_path,
+                },
+            }
+        )
+
+        return audio_path
+
+    @tool
+    def update_todo(items: list[dict]) -> str:
+        """
+        更新当前任务计划。
+        每个 item 可包含 content 或 description，以及 status。
+        status 可为 pending、in_progress、completed。
+        """
+        todo_items = [TodoItem.model_validate(item) for item in items]
+        return todo_manager.update(todo_items)
+
+    return [
+        read_pdf_pages,
+        get_pdf_pages,
+        generate_narration,
+        generate_audio,
+        update_todo,
+    ]

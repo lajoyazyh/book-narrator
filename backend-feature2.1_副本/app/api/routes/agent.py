@@ -1,0 +1,1456 @@
+# app/api/routes/agent.py
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import requests
+from fastapi import APIRouter, UploadFile, File, BackgroundTasks
+from fastapi.responses import FileResponse
+
+from app.services.audio_service import generate_backend_audio, BACKEND_AUDIO_DIR
+from app.services.pdf_reader import (
+    get_pdf_page_count,
+    detect_chapters_from_pdf,
+    build_page_chunks,
+    find_likely_body_start_page,
+)
+
+
+router = APIRouter(prefix="/agent", tags=["agent"])
+
+
+BOOKS_DIR = Path(
+    os.getenv("BOOKS_DIR", Path.home() / "Desktop" / "shared" / "books")
+).resolve()
+
+AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://localhost:8000")
+AGENT_RUN_URL = f"{AGENT_API_BASE_URL}/api/v1/agent/run"
+
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "output")).resolve()
+HISTORY_FILE = OUTPUT_DIR / "narration_history.json"
+
+
+BOOKS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+BACKEND_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ok(data=None, message: str = "ok"):
+    return {
+        "code": 200,
+        "message": message,
+        "data": data,
+    }
+
+
+def fail(message: str, code: int = 500, data=None):
+    return {
+        "code": code,
+        "message": message,
+        "data": data,
+    }
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def safe_filename(filename: str) -> str:
+    name = Path(filename).name
+    name = name.replace("/", "_").replace("\\", "_")
+    return name
+
+
+def remove_pdf_suffix(filename: str) -> str:
+    name = Path(filename).name
+
+    if name.lower().endswith(".pdf"):
+        name = name[:-4]
+
+    parts = name.split("_", 1)
+    if len(parts) == 2 and re.fullmatch(r"[0-9a-fA-F]{8}", parts[0]):
+        return parts[1]
+
+    return name
+
+
+def build_book_item(pdf_path: Path) -> dict:
+    filename = pdf_path.name
+    book_id = filename.split("_", 1)[0]
+
+    return {
+        "book_id": book_id,
+        "filename": filename,
+        "title": remove_pdf_suffix(filename),
+        "path": str(pdf_path.resolve()),
+    }
+
+
+def find_pdf_by_book_id(book_id: str) -> Optional[Path]:
+    if not book_id:
+        return None
+
+    for pdf_path in BOOKS_DIR.glob("*.pdf"):
+        if pdf_path.name.startswith(f"{book_id}_"):
+            return pdf_path.resolve()
+
+    return None
+
+
+def load_history() -> list[dict]:
+    if not HISTORY_FILE.exists():
+        return []
+
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            return data
+
+        return []
+    except Exception:
+        return []
+
+
+def save_history(items: list[dict]) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+
+def append_history(item: dict) -> None:
+    items = load_history()
+    items.insert(0, item)
+    save_history(items)
+
+
+def update_history_item(task_id: str, **updates) -> None:
+    items = load_history()
+
+    for item in items:
+        if item.get("task_id") == task_id:
+            item.update(updates)
+            item["updated_at"] = now_iso()
+            save_history(items)
+            return
+
+
+def get_history_item(task_id: str) -> dict | None:
+    items = load_history()
+
+    for item in items:
+        if item.get("task_id") == task_id:
+            return item
+
+    return None
+
+
+def is_task_cancelled(task_id: str) -> bool:
+    item = get_history_item(task_id)
+
+    if not item:
+        return False
+
+    return item.get("status") in {"cancelled", "canceled"}
+
+
+def get_chapters_for_pdf(pdf_path: Path, page_count: int) -> list[dict]:
+    chapters = detect_chapters_from_pdf(str(pdf_path))
+
+    if chapters:
+        return chapters
+
+    body_start_page = find_likely_body_start_page(str(pdf_path))
+
+    return build_page_chunks(
+        total_pages=page_count,
+        chunk_size=5,
+        start_page=body_start_page,
+    )
+
+
+def get_selected_chapter(
+        pdf_path: Path,
+        chapter_number: int,
+) -> tuple[dict | None, list[dict], int]:
+    page_count = get_pdf_page_count(str(pdf_path))
+    chapters = get_chapters_for_pdf(pdf_path, page_count)
+
+    selected_chapter = None
+
+    for chapter in chapters:
+        if int(chapter.get("chapter_number", 0)) == chapter_number:
+            selected_chapter = chapter
+            break
+
+    return selected_chapter, chapters, page_count
+
+
+def normalize_task_instruction(task_instruction: Optional[str]) -> str:
+    if not task_instruction or not task_instruction.strip():
+        return ""
+
+    return task_instruction.strip()
+
+
+def normalize_reading_mode(reading_mode: Optional[str]) -> str:
+    if not reading_mode:
+        return "quick"
+
+    value = str(reading_mode).strip().lower()
+
+    if value in {"deep", "深度", "深度阅读", "详细", "详细阅读"}:
+        return "deep"
+
+    return "quick"
+
+
+
+def normalize_output_language(output_language: Optional[str]) -> str:
+    if not output_language:
+        return "en"
+
+    value = str(output_language).strip().lower()
+
+    aliases = {
+        "english": "en",
+        "en-us": "en",
+        "英文": "en",
+
+        "chinese": "zh",
+        "zh-cn": "zh",
+        "中文": "zh",
+
+        "french": "fr",
+        "français": "fr",
+        "法语": "fr",
+
+        "spanish": "es",
+        "español": "es",
+        "西班牙语": "es",
+
+        "russian": "ru",
+        "русский": "ru",
+        "俄语": "ru",
+
+        "arabic": "ar",
+        "العربية": "ar",
+        "阿拉伯语": "ar",
+    }
+
+    value = aliases.get(value, value)
+
+    if value not in {"ar", "zh", "en", "fr", "ru", "es"}:
+        return "en"
+
+    return value
+
+
+def get_output_language_text(output_language: str) -> str:
+    language = normalize_output_language(output_language)
+
+    mapping = {
+        "ar": "Arabic",
+        "zh": "Chinese",
+        "en": "English",
+        "fr": "French",
+        "ru": "Russian",
+        "es": "Spanish",
+    }
+
+    return mapping.get(language, "English")
+
+
+def get_output_language_instruction(output_language: str) -> str:
+    language = normalize_output_language(output_language)
+    language_text = get_output_language_text(language)
+
+    if language == "zh":
+        return """
+[Output Language Requirement]
+The final narration script must be written in Chinese.
+Do not output English narration.
+The generated audio will be based on this script, so the final text must be natural spoken Chinese.
+"""
+
+    if language == "ar":
+        return """
+[Output Language Requirement]
+The final narration script must be written in Arabic.
+Do not output English or Chinese narration.
+The generated audio will be based on this script, so the final text must be natural spoken Arabic.
+"""
+
+    return f"""
+[Output Language Requirement]
+The final narration script must be written in {language_text}.
+Do not output Chinese narration unless the selected output language is Chinese.
+Do not mix languages unless names or source-specific terms require it.
+The generated audio will be based on this script, so the final text must be natural spoken {language_text}.
+"""
+
+
+def get_reading_mode_text(reading_mode: str) -> str:
+    return "深度阅读" if reading_mode == "deep" else "快速阅读"
+
+
+def build_default_task_name(
+        book_title: str,
+        filename: str,
+        mode: str,
+        start_page=None,
+        end_page=None,
+        chapter_number=None,
+        chapter_title: str = "",
+) -> str:
+    base_name = book_title or remove_pdf_suffix(filename) or "未命名书籍"
+
+    if mode == "page":
+        return f"{base_name} 第{start_page}-{end_page}页解说"
+
+    if mode == "chapter":
+        if chapter_title:
+            return f"{base_name} {chapter_title}解说"
+        return f"{base_name} 第{chapter_number}章解说"
+
+    if mode == "custom":
+        return f"自定义文本解说 {now_iso()}"
+
+    return f"{base_name} 解说任务"
+
+
+def build_mode_requirement(reading_mode: str) -> str:
+    if reading_mode == "deep":
+        return """
+【阅读模式要求】
+当前为深度阅读。请更完整地讲述人物、事件、对话、冲突、心理变化和前后因果。不要只做概括，要按照情节顺序重新讲故事。输出内容应明显长于快速阅读。
+"""
+
+    return """
+【阅读模式要求】
+当前为快速阅读。请压缩次要描写，用较短篇幅讲清主要人物、关键事件和重要转折。不要写成长篇分析。
+"""
+
+
+
+def normalize_output_language(output_language):
+    if not output_language:
+        return "en"
+
+    value = str(output_language).strip().lower()
+
+    aliases = {
+        "english": "en",
+        "英文": "en",
+        "en-us": "en",
+
+        "chinese": "zh",
+        "中文": "zh",
+        "zh-cn": "zh",
+
+        "french": "fr",
+        "法语": "fr",
+        "français": "fr",
+
+        "spanish": "es",
+        "西班牙语": "es",
+        "español": "es",
+
+        "russian": "ru",
+        "俄语": "ru",
+        "русский": "ru",
+
+        "arabic": "ar",
+        "阿拉伯语": "ar",
+        "العربية": "ar",
+    }
+
+    value = aliases.get(value, value)
+
+    if value not in {"en", "zh", "fr", "es", "ru", "ar"}:
+        return "en"
+
+    return value
+
+
+def get_output_language_text(output_language):
+    language = normalize_output_language(output_language)
+
+    mapping = {
+        "en": "English",
+        "zh": "Chinese",
+        "fr": "French",
+        "es": "Spanish",
+        "ru": "Russian",
+        "ar": "Arabic",
+    }
+
+    return mapping.get(language, "English")
+
+
+def append_output_language_requirement(user_request: str, output_language: str) -> str:
+    """
+    Append a final high-priority language instruction to the prompt sent to Gemma4.
+
+    This is intentionally appended at the end so it overrides older Chinese-only
+    prompt text such as “生成中文故事解说”.
+    """
+    language = normalize_output_language(output_language)
+    language_text = get_output_language_text(language)
+
+    if language == "zh":
+        instruction = """
+[FINAL OUTPUT LANGUAGE OVERRIDE]
+The selected output language is Chinese.
+The final narration script MUST be written in Chinese.
+Do not output English, French, Spanish, Russian, or Arabic narration.
+The audio will be generated from this script, so the final text must be natural spoken Chinese.
+"""
+    else:
+        instruction = f"""
+[FINAL OUTPUT LANGUAGE OVERRIDE]
+The selected output language is {language_text}.
+The final narration script MUST be written in {language_text}.
+Do not output Chinese narration.
+Do not mix languages unless a character name, book title, place name, or source-specific term must be preserved.
+The audio will be generated from this script, so the final text must be natural spoken {language_text}.
+"""
+
+    return (user_request or "").rstrip() + "\n\n" + instruction.strip() + "\n"
+
+
+
+def build_inline_output_language_requirement(output_language: str) -> str:
+    language = normalize_output_language(output_language)
+
+    mapping = {
+        "en": "English",
+        "zh": "Chinese",
+        "fr": "French",
+        "es": "Spanish",
+        "ru": "Russian",
+        "ar": "Arabic",
+    }
+
+    language_text = mapping.get(language, "English")
+
+    if language == "zh":
+        return """
+Output language requirement:
+The final narration script MUST be written in Chinese.
+Do not output English, French, Spanish, Russian, or Arabic narration.
+The audio will be generated from this script, so the text must be natural spoken Chinese.
+""".strip()
+
+    return f"""
+Output language requirement:
+The final narration script MUST be written entirely in {language_text}.
+Chinese output is forbidden.
+Do not mix languages unless a character name, book title, place name, or source-specific term must be preserved.
+The audio will be generated from this script, so the text must be natural spoken {language_text}.
+""".strip()
+
+
+def build_agent_request_by_pdf_path(
+        pdf_path: str,
+        start_page: int,
+        end_page: int,
+        style: str,
+        voice: str,
+        task_instruction: str,
+        source_info: str,
+        reading_mode: str = "quick",
+        output_language: str = "en",
+) -> str:
+    task_instruction = normalize_task_instruction(task_instruction)
+    reading_mode = normalize_reading_mode(reading_mode)
+    reading_mode_text = get_reading_mode_text(reading_mode)
+    mode_requirement = build_mode_requirement(reading_mode)
+
+    extra_requirement = task_instruction or (
+        "请根据原文情节重新讲述故事，不要写主题总结，不要编造原文没有的内容。"
+    )
+
+    return f"""
+你是一个书籍解说助手。请根据指定 PDF 文件路径和页码范围读取原文内容，然后严格基于读取到的原文生成中文故事解说。
+
+【PDF 文件路径】
+{pdf_path}
+
+【页码范围】
+第 {start_page} 页到第 {end_page} 页
+
+【资料来源】
+{source_info}
+
+【解说风格】
+{style}
+
+【声音偏好】
+{voice}
+
+【阅读模式】
+{reading_mode_text}
+
+【用户额外要求】
+{extra_requirement}
+
+{mode_requirement}
+
+【内容规则】
+你只能使用原文中明确出现的信息，不要使用原文之外的信息，不要补充背景，不要编造人物关系、事件、地点、原因、心理活动或结局。如果原文没有说明，请直接省略，不要推测。不要为了让故事完整而补写原文没有出现的内容。
+
+【写作要求】
+请按照人物和事件发生顺序重新讲述故事，重点保留人物、事件顺序、冲突变化、场景氛围和已经出现的结果。语言要自然连贯，适合直接转成语音播放。解说可以有一定口播感，但必须忠实原文。
+
+【输出规则】
+只输出最终解说正文。不要输出思考过程，不要输出分析步骤，不要输出拆解过程，不要输出推理过程。不要输出“Thinking”“done thinking”“Here's a thinking process”“分析如下”“总结如下”“以下是总结”“最终解说正文”等提示语。不要标题，不要列表，不要编号，不要 Markdown，不要星号，不要井号，不要项目符号。
+
+现在请直接输出最终解说正文。
+"""
+
+
+def build_agent_request_by_text(
+        custom_text: str,
+        style: str,
+        voice: str,
+        task_instruction: str,
+        source_info: str,
+        reading_mode: str = "quick",
+) -> str:
+    task_instruction = normalize_task_instruction(task_instruction)
+    reading_mode = normalize_reading_mode(reading_mode)
+    reading_mode_text = get_reading_mode_text(reading_mode)
+    mode_requirement = build_mode_requirement(reading_mode)
+
+    extra_requirement = task_instruction or (
+        "请根据原文情节重新讲述故事，不要写主题总结，不要编造原文没有的内容。"
+    )
+
+    return f"""
+你是一个书籍解说助手。请严格根据我提供的原文内容，生成一段中文故事解说。
+
+【资料来源】
+{source_info}
+
+【解说风格】
+{style}
+
+【声音偏好】
+{voice}
+
+【阅读模式】
+{reading_mode_text}
+
+【用户额外要求】
+{extra_requirement}
+
+【原文内容】
+{custom_text}
+
+{mode_requirement}
+
+【内容规则】
+你只能使用原文中明确出现的信息，不要使用原文之外的信息，不要补充背景，不要编造人物关系、事件、地点、原因、心理活动或结局。如果原文没有说明，请直接省略，不要推测。不要为了让故事完整而补写原文没有出现的内容。
+
+【写作要求】
+请按照人物和事件发生顺序重新讲述故事，重点保留人物、事件顺序、冲突变化、场景氛围和已经出现的结果。语言要自然连贯，适合直接转成语音播放。解说可以有一定口播感，但必须忠实原文。
+
+【输出规则】
+只输出最终解说正文。不要输出思考过程，不要输出分析步骤，不要输出拆解过程，不要输出推理过程。不要输出“Thinking”“done thinking”“Here's a thinking process”“分析如下”“总结如下”“以下是总结”“最终解说正文”等提示语。不要标题，不要列表，不要编号，不要 Markdown，不要星号，不要井号，不要项目符号。
+
+现在请直接输出最终解说正文。
+"""
+
+
+def run_agent(user_request: str) -> dict:
+    payload = {
+        "user_request": user_request,
+        "reset_context": True,
+    }
+
+    response = requests.post(
+        AGENT_RUN_URL,
+        json=payload,
+        timeout=1200,
+    )
+    response.raise_for_status()
+
+    try:
+        return response.json()
+    except Exception:
+        return {
+            "result": response.text,
+            "raw_text": response.text,
+        }
+
+
+def extract_script(agent_result: dict) -> str:
+    if not isinstance(agent_result, dict):
+        return str(agent_result)
+
+    result = agent_result.get("result")
+    if isinstance(result, str) and result.strip():
+        return result.strip()
+
+    data = agent_result.get("data")
+    if isinstance(data, dict):
+        for key in ["result", "script", "output", "text"]:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    output = agent_result.get("output")
+    if isinstance(output, str) and output.strip():
+        return output.strip()
+
+    text = agent_result.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    error = agent_result.get("error")
+    if isinstance(error, str) and error.strip():
+        return f"Agent 执行失败：{error}"
+
+    return ""
+
+
+def clean_script_output(text: str) -> str:
+    if not text:
+        return ""
+
+    text = str(text)
+
+    done_markers = [
+        "...done thinking.",
+        "done thinking.",
+        "Done thinking.",
+        "...Done thinking.",
+        "思考结束。",
+        "思考完成。",
+    ]
+
+    for marker in done_markers:
+        if marker in text:
+            text = text.split(marker, 1)[-1]
+
+    thinking_markers = [
+        "Thinking...",
+        "Thinking:",
+        "Here's a thinking process",
+        "Here is a thinking process",
+        "思考过程",
+        "分析过程",
+        "推理过程",
+    ]
+
+    for marker in thinking_markers:
+        if marker in text:
+            text = text.split(marker, 1)[-1]
+
+    remove_phrases = [
+        "以下是总结：",
+        "以下是故事总结：",
+        "总结如下：",
+        "以下是解说：",
+        "以下是最终解说正文：",
+        "最终解说正文：",
+        "最终总结正文：",
+        "请直接输出最终总结正文。",
+        "请直接输出最终解说正文。",
+        "根据原文内容，",
+        "故事梗概",
+        "主题分析",
+        "读后感",
+        "文学升华",
+    ]
+
+    for phrase in remove_phrases:
+        text = text.replace(phrase, "")
+
+    replacements = {
+        "\\n": " ",
+        "\r": " ",
+        "\t": " ",
+        "**": "",
+        "*": "",
+        "#": "",
+        "##": "",
+        "###": "",
+        "•": "",
+        "·": "",
+        "- ": "",
+        "— ": "",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\s*\d+[\.、]\s*", " ", text)
+
+    return text.strip()
+
+
+def extract_audio_urls(agent_result: dict) -> list[str]:
+    urls: list[str] = []
+
+    if not isinstance(agent_result, dict):
+        return urls
+
+    context = agent_result.get("context_summary") or agent_result.get("context") or {}
+
+    if isinstance(context, dict):
+        last_audio_file = context.get("last_audio_file")
+        if isinstance(last_audio_file, str):
+            urls.append(last_audio_file)
+
+        audio_files = context.get("audio_files")
+        if isinstance(audio_files, dict):
+            for value in audio_files.values():
+                if isinstance(value, str):
+                    urls.append(value)
+
+    tool_calls = agent_result.get("tool_calls", [])
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+
+            output_data = call.get("output_data", {})
+            if isinstance(output_data, dict):
+                audio_path = output_data.get("audio_path")
+                if isinstance(audio_path, str):
+                    urls.append(audio_path)
+
+    data = agent_result.get("data")
+    if isinstance(data, dict):
+        audio_urls = data.get("audio_urls")
+        if isinstance(audio_urls, list):
+            for url in audio_urls:
+                if isinstance(url, str):
+                    urls.append(url)
+
+        audio_url = data.get("audio_url")
+        if isinstance(audio_url, str):
+            urls.append(audio_url)
+
+    seen = set()
+    unique_urls = []
+
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+
+    return unique_urls
+
+
+def build_history_item(
+        task_id: str,
+        task_name: str = "",
+        book_id: str = "",
+        book_title: str = "",
+        filename: str = "",
+        mode: str = "page",
+        style: str = "短视频",
+        voice: str = "晓晓",
+        reading_mode: str = "quick",
+        start_page=None,
+        end_page=None,
+        chapter_number=None,
+        chapter_title: str = "",
+        task_instruction: str = "",
+        custom_text: str = "",
+        script: str = "",
+        audio_urls: Optional[list[str]] = None,
+        source_info: str = "",
+        status: str = "success",
+        error_message: str = "",
+        remark: str = "",
+        favorite: bool = False,
+
+        output_language: str = "en",) -> dict:
+    return {
+        "task_id": task_id,
+        "task_name": task_name,
+        "book_id": book_id,
+        "book_title": book_title,
+        "filename": filename,
+        "mode": mode,
+        "style": style,
+        "voice": voice,
+        "reading_mode": reading_mode,
+        "output_language": output_language,
+        "start_page": start_page,
+        "end_page": end_page,
+        "chapter_number": chapter_number,
+        "chapter_title": chapter_title,
+        "task_instruction": task_instruction,
+        "custom_text": custom_text,
+        "script": script,
+        "audio_urls": audio_urls or [],
+        "source_info": source_info,
+        "status": status,
+        "error_message": error_message,
+        "remark": remark,
+        "favorite": favorite,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+
+def run_narration_task_background(
+        task_id: str,
+        user_request: str,
+        book_id: str,
+        book_title: str,
+        filename: str,
+        mode: str,
+        style: str,
+        voice: str,
+        reading_mode: str,
+        output_language: str,
+        start_page,
+        end_page,
+        chapter_number,
+        chapter_title: str,
+        task_instruction: str,
+        custom_text: str,
+        source_info: str,
+):
+    try:
+        print("========== BACKGROUND_TASK_STARTED ==========")
+        print(task_id)
+
+        if is_task_cancelled(task_id):
+            return
+
+        user_request = append_output_language_requirement(user_request, output_language)
+        print("========== FINAL USER_REQUEST_TO_AGENT ==========")
+        print(user_request)
+        agent_result = run_agent(user_request)
+
+        if is_task_cancelled(task_id):
+            return
+
+        print("========== RAW_AGENT_RESULT ==========")
+        print(agent_result)
+
+        script = extract_script(agent_result)
+        script = clean_script_output(script)
+
+        if is_task_cancelled(task_id):
+            return
+
+        if not script.strip():
+            update_history_item(
+                task_id,
+                status="failed",
+                error_message="Agent 没有生成有效解说词。当前返回结果中 output/result 为空，请检查 Agent 的 PDF 读取或生成逻辑。",
+                script="",
+                audio_urls=[],
+            )
+            return
+
+        raw_audio_urls = extract_audio_urls(agent_result)
+
+        if is_task_cancelled(task_id):
+            return
+
+        audio_urls: list[str] = []
+
+        try:
+            backend_audio_url = generate_backend_audio(
+                text=script,
+                task_id=task_id,
+                voice_name=voice,
+                output_language=output_language,
+            )
+
+            if not is_task_cancelled(task_id):
+                audio_urls.append(backend_audio_url)
+
+        except Exception as audio_error:
+            print("========== BACKEND_AUDIO_GENERATE_FAILED ==========")
+            print(audio_error)
+
+        if is_task_cancelled(task_id):
+            return
+
+        for url in raw_audio_urls:
+            if isinstance(url, str) and url not in audio_urls:
+                audio_urls.append(url)
+
+        update_history_item(
+            task_id,
+            status="success",
+            error_message="",
+            script=script,
+            audio_urls=audio_urls,
+        )
+
+        print("========== BACKGROUND_TASK_SUCCESS ==========")
+        print(task_id)
+
+    except requests.exceptions.ConnectionError as e:
+        if not is_task_cancelled(task_id):
+            update_history_item(
+                task_id,
+                status="failed",
+                error_message=f"调用 Agent 失败：无法连接 Agent 服务，请确认 agent-master 已启动。详细信息：{str(e)}",
+                script="",
+                audio_urls=[],
+            )
+
+    except requests.exceptions.Timeout:
+        if not is_task_cancelled(task_id):
+            update_history_item(
+                task_id,
+                status="failed",
+                error_message="调用 Agent 超时，请缩小页码范围或稍后重试。",
+                script="",
+                audio_urls=[],
+            )
+
+    except Exception as e:
+        if not is_task_cancelled(task_id):
+            update_history_item(
+                task_id,
+                status="failed",
+                error_message=f"后台任务执行失败：{str(e)}",
+                script="",
+                audio_urls=[],
+            )
+
+
+@router.get("/health")
+def check_agent_health():
+    try:
+        response = requests.get(
+            f"{AGENT_API_BASE_URL}/api/v1/health",
+            timeout=10,
+        )
+        response.raise_for_status()
+
+        return ok(
+            {
+                "agent_api_base_url": AGENT_API_BASE_URL,
+                "agent_status": response.text,
+                "books_dir": str(BOOKS_DIR),
+                "history_file": str(HISTORY_FILE),
+                "backend_audio_dir": str(BACKEND_AUDIO_DIR),
+            }
+        )
+
+    except Exception as e:
+        return fail(f"Agent 不可用：{str(e)}", code=500)
+
+
+@router.post("/books/upload")
+async def upload_book(file: UploadFile = File(...)):
+    if not file.filename:
+        return fail("文件名不能为空", code=400)
+
+    if not file.filename.lower().endswith(".pdf"):
+        return fail("只支持上传 PDF 文件", code=400)
+
+    BOOKS_DIR.mkdir(parents=True, exist_ok=True)
+
+    book_id = str(uuid.uuid4())[:8]
+    original_name = safe_filename(file.filename)
+    saved_name = f"{book_id}_{original_name}"
+    save_path = BOOKS_DIR / saved_name
+
+    content = await file.read()
+
+    with open(save_path, "wb") as f:
+        f.write(content)
+
+    return ok(build_book_item(save_path), message="上传成功")
+
+
+@router.get("/books")
+def get_books():
+    BOOKS_DIR.mkdir(parents=True, exist_ok=True)
+
+    books = []
+
+    for pdf_path in sorted(
+            BOOKS_DIR.glob("*.pdf"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+    ):
+        books.append(build_book_item(pdf_path))
+
+    return ok(books)
+
+
+@router.get("/books/{book_id}/outline")
+def get_book_outline(book_id: str):
+    pdf_path = find_pdf_by_book_id(book_id)
+
+    if not pdf_path:
+        return fail("未找到该书籍 PDF", code=404)
+
+    try:
+        page_count = get_pdf_page_count(str(pdf_path))
+        chapters = get_chapters_for_pdf(pdf_path, page_count)
+
+        return ok(
+            {
+                "book_id": book_id,
+                "title": remove_pdf_suffix(pdf_path.name),
+                "page_count": page_count,
+                "pages": page_count,
+                "chapters": chapters,
+                "message": "已返回章节信息；若未识别到真实章节，则使用分页片段。",
+            }
+        )
+
+    except Exception as e:
+        return fail(f"读取 PDF 章节信息失败：{str(e)}", code=500)
+
+
+@router.get("/books/{book_id}/file")
+def get_book_file(book_id: str):
+    pdf_path = find_pdf_by_book_id(book_id)
+
+    if not pdf_path:
+        return fail("未找到该书籍 PDF", code=404)
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=pdf_path.name,
+    )
+
+
+@router.get("/backend-audio/{filename}")
+def get_backend_audio(filename: str):
+    safe_name = safe_filename(filename)
+    audio_path = BACKEND_AUDIO_DIR / safe_name
+
+    if not audio_path.exists() or not audio_path.is_file():
+        return fail(f"未找到音频文件：{filename}", code=404)
+
+    return FileResponse(
+        path=audio_path,
+        media_type="audio/mpeg",
+        filename=audio_path.name,
+    )
+
+
+@router.post("/book-narrate")
+def create_narration_task(payload: dict, background_tasks: BackgroundTasks):
+    task_id = str(uuid.uuid4())[:8]
+
+    task_name_from_user = str(payload.get("task_name") or "").strip()
+
+    style = payload.get("style", "短视频")
+    voice = payload.get("voice", "晓晓")
+    mode = payload.get("mode", "page")
+    reading_mode = normalize_reading_mode(payload.get("reading_mode"))
+    output_language = normalize_output_language(payload.get("output_language"))
+
+    book_id = payload.get("book_id") or ""
+    book_title = ""
+    filename = ""
+
+    start_page = None
+    end_page = None
+    chapter_number = payload.get("chapter_number")
+    chapter_title = ""
+
+    custom_text = payload.get("custom_text") or payload.get("text") or ""
+
+    task_instruction = (
+            payload.get("task_instruction")
+            or payload.get("instruction")
+            or payload.get("requirement")
+            or ""
+    )
+
+
+    inline_language_requirement = build_inline_output_language_requirement(output_language)
+    if task_instruction:
+        task_instruction = f"{task_instruction}\n\n{inline_language_requirement}"
+    else:
+        task_instruction = inline_language_requirement
+
+    source_info = ""
+    user_request = ""
+
+    try:
+        if mode == "custom":
+            if not custom_text.strip():
+                return fail("自定义文本不能为空", code=400, data={"task_id": task_id})
+
+            source_info = "用户自定义文本"
+            book_title = "自定义文本"
+
+            user_request = build_agent_request_by_text(
+                custom_text=custom_text.strip(),
+                style=style,
+                voice=voice,
+                task_instruction=task_instruction,
+                source_info=source_info,
+                reading_mode=reading_mode,
+                output_language=output_language,
+            )
+
+        else:
+            if not book_id:
+                return fail("缺少 book_id", code=400, data={"task_id": task_id})
+
+            pdf_path = find_pdf_by_book_id(book_id)
+
+            if not pdf_path:
+                return fail(
+                    f"未找到该书籍 PDF。当前后端读取目录：{BOOKS_DIR}",
+                    code=404,
+                    data={"task_id": task_id},
+                )
+
+            filename = pdf_path.name
+            book_title = remove_pdf_suffix(pdf_path.name)
+            page_count = get_pdf_page_count(str(pdf_path))
+
+            if mode == "chapter":
+                chapter_number = int(payload.get("chapter_number") or 0)
+
+                if chapter_number <= 0:
+                    return fail("请选择有效章节", code=400, data={"task_id": task_id})
+
+                selected_chapter, chapters, page_count = get_selected_chapter(
+                    pdf_path=pdf_path,
+                    chapter_number=chapter_number,
+                )
+
+                if not selected_chapter:
+                    return fail(
+                        "未找到所选章节",
+                        code=404,
+                        data={
+                            "task_id": task_id,
+                            "chapters": chapters,
+                        },
+                    )
+
+                start_page = int(selected_chapter["start_page"])
+                end_page = int(selected_chapter["end_page"])
+                chapter_title = str(selected_chapter.get("title", f"第 {chapter_number} 章"))
+
+                if start_page < 1:
+                    start_page = 1
+
+                if end_page > page_count:
+                    end_page = page_count
+
+                if start_page > end_page:
+                    return fail(
+                        "章节页码范围异常",
+                        code=400,
+                        data={
+                            "task_id": task_id,
+                            "page_count": page_count,
+                            "start_page": start_page,
+                            "end_page": end_page,
+                        },
+                    )
+
+                source_info = (
+                    f"{pdf_path.name} "
+                    f"{chapter_title} "
+                    f"第 {start_page} 页到第 {end_page} 页"
+                )
+
+            else:
+                start_page = int(payload.get("start_page") or payload.get("startPage") or 1)
+                end_page = int(payload.get("end_page") or payload.get("endPage") or 3)
+
+                if start_page <= 0 or end_page <= 0:
+                    return fail("页码必须大于 0", code=400, data={"task_id": task_id})
+
+                if start_page > end_page:
+                    return fail("开始页不能大于结束页", code=400, data={"task_id": task_id})
+
+                if end_page > page_count:
+                    return fail(
+                        f"结束页不能超过 PDF 总页数。本书共 {page_count} 页。",
+                        code=400,
+                        data={
+                            "task_id": task_id,
+                            "page_count": page_count,
+                            "start_page": start_page,
+                            "end_page": end_page,
+                        },
+                    )
+
+                source_info = f"{pdf_path.name} 第 {start_page} 页到第 {end_page} 页"
+
+            pdf_abs_path = str(pdf_path.resolve())
+
+            user_request = build_agent_request_by_pdf_path(
+                pdf_path=pdf_abs_path,
+                start_page=start_page,
+                end_page=end_page,
+                style=style,
+                voice=voice,
+                task_instruction=task_instruction,
+                source_info=source_info,
+                reading_mode=reading_mode,
+                output_language=output_language,
+            )
+
+        task_name = task_name_from_user or build_default_task_name(
+            book_title=book_title,
+            filename=filename,
+            mode=mode,
+            start_page=start_page,
+            end_page=end_page,
+            chapter_number=chapter_number,
+            chapter_title=chapter_title,
+        )
+
+        print("========== BACKEND_SEND_TO_AGENT ==========")
+        print(user_request[:2500])
+
+        user_request = append_output_language_requirement(user_request, output_language)
+        print("========== USER_REQUEST_TO_AGENT ==========")
+        print(user_request)
+        history_item = build_history_item(
+            task_id=task_id,
+            task_name=task_name,
+            book_id=book_id,
+            book_title=book_title,
+            filename=filename,
+            mode=mode,
+            style=style,
+            voice=voice,
+            reading_mode=reading_mode,
+            output_language=output_language,
+            start_page=start_page,
+            end_page=end_page,
+            chapter_number=chapter_number,
+            chapter_title=chapter_title,
+            task_instruction=task_instruction,
+            custom_text=custom_text,
+            script="",
+            audio_urls=[],
+            source_info=source_info,
+            status="running",
+            error_message="",
+        )
+
+        append_history(history_item)
+
+        background_tasks.add_task(
+            run_narration_task_background,
+            task_id,
+            user_request,
+            book_id,
+            book_title,
+            filename,
+            mode,
+            style,
+            voice,
+            reading_mode,
+            output_language,
+            start_page,
+            end_page,
+            chapter_number,
+            chapter_title,
+            task_instruction,
+            custom_text,
+            source_info,
+        )
+
+        return ok(
+            {
+                "task_id": task_id,
+                "task_name": task_name,
+                "status": "running",
+                "message": "任务已创建，正在后台生成。",
+                "source_info": source_info,
+                "reading_mode": reading_mode,
+            }
+        )
+
+    except Exception as e:
+        message = f"创建后台解说任务失败：{str(e)}"
+
+        task_name = task_name_from_user or "创建失败的解说任务"
+
+        user_request = append_output_language_requirement(user_request, output_language)
+        print("========== USER_REQUEST_TO_AGENT ==========")
+        print(user_request)
+        history_item = build_history_item(
+            task_id=task_id,
+            task_name=task_name,
+            book_id=book_id,
+            book_title=book_title,
+            filename=filename,
+            mode=mode,
+            style=style,
+            voice=voice,
+            reading_mode=reading_mode,
+            output_language=output_language,
+            start_page=start_page,
+            end_page=end_page,
+            chapter_number=chapter_number,
+            chapter_title=chapter_title,
+            task_instruction=task_instruction,
+            custom_text=custom_text,
+            script="",
+            audio_urls=[],
+            source_info=source_info,
+            status="failed",
+            error_message=message,
+        )
+        append_history(history_item)
+
+        return fail(message, code=500, data={"task_id": task_id, "task_name": task_name})
+
+
+@router.post("/narration-history/{task_id}/cancel")
+def cancel_narration_task(task_id: str):
+    item = get_history_item(task_id)
+
+    if not item:
+        return fail("任务不存在", code=404)
+
+    status = item.get("status")
+
+    if status == "success":
+        return fail("任务已经完成，不能中止", code=400, data=item)
+
+    if status == "failed":
+        return fail("任务已经失败，不能中止", code=400, data=item)
+
+    if status in {"cancelled", "canceled"}:
+        return ok(item, message="任务已经中止")
+
+    update_history_item(
+        task_id,
+        status="cancelled",
+        error_message="用户已中止任务",
+    )
+
+    updated_item = get_history_item(task_id)
+
+    return ok(updated_item, message="任务已中止")
+
+
+@router.get("/narration-history")
+def list_narration_history(keyword: str | None = None, book_id: str | None = None):
+    items = load_history()
+
+    # 给旧历史记录补 task_name，避免前端显示为空
+    changed = False
+    for item in items:
+        if not item.get("task_name"):
+            item["task_name"] = build_default_task_name(
+                book_title=item.get("book_title", ""),
+                filename=item.get("filename", ""),
+                mode=item.get("mode", "page"),
+                start_page=item.get("start_page"),
+                end_page=item.get("end_page"),
+                chapter_number=item.get("chapter_number"),
+                chapter_title=item.get("chapter_title", ""),
+            )
+            changed = True
+
+    if changed:
+        save_history(items)
+
+    if book_id:
+        items = [item for item in items if item.get("book_id") == book_id]
+
+    if keyword:
+        keyword_lower = keyword.lower()
+
+        def match(item: dict) -> bool:
+            fields = [
+                item.get("task_name", ""),
+                item.get("book_title", ""),
+                item.get("filename", ""),
+                item.get("task_instruction", ""),
+                item.get("script", ""),
+                item.get("source_info", ""),
+                item.get("remark", ""),
+                item.get("chapter_title", ""),
+                item.get("reading_mode", ""),
+                item.get("status", ""),
+            ]
+            return any(keyword_lower in str(field).lower() for field in fields)
+
+        items = [item for item in items if match(item)]
+
+    return ok(items)
+
+
+@router.get("/narration-history/{task_id}")
+def get_narration_history_detail(task_id: str):
+    items = load_history()
+
+    for item in items:
+        if item.get("task_id") == task_id:
+            if not item.get("task_name"):
+                item["task_name"] = build_default_task_name(
+                    book_title=item.get("book_title", ""),
+                    filename=item.get("filename", ""),
+                    mode=item.get("mode", "page"),
+                    start_page=item.get("start_page"),
+                    end_page=item.get("end_page"),
+                    chapter_number=item.get("chapter_number"),
+                    chapter_title=item.get("chapter_title", ""),
+                )
+            return ok(item)
+
+    return fail("历史解说记录不存在", code=404)
+
+
+@router.put("/narration-history/{task_id}")
+def update_narration_history(task_id: str, payload: dict):
+    items = load_history()
+
+    for item in items:
+        if item.get("task_id") == task_id:
+            if "task_name" in payload:
+                item["task_name"] = str(payload.get("task_name") or "").strip()
+
+            if "remark" in payload:
+                item["remark"] = payload.get("remark") or ""
+
+            if "favorite" in payload:
+                item["favorite"] = bool(payload.get("favorite"))
+
+            item["updated_at"] = now_iso()
+
+            save_history(items)
+            return ok(item)
+
+    return fail("历史解说记录不存在", code=404)
+
+
+@router.delete("/narration-history/{task_id}")
+def delete_narration_history(task_id: str):
+    items = load_history()
+    new_items = [item for item in items if item.get("task_id") != task_id]
+
+    if len(new_items) == len(items):
+        return fail("历史解说记录不存在", code=404)
+
+    save_history(new_items)
+
+    return ok(True)

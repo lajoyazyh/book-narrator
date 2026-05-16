@@ -1,0 +1,422 @@
+# src/tools/narrator.py
+
+"""
+书籍解说生成工具。
+
+简化稳定版：
+1. 不再使用复杂 prompt；
+2. 不再加入大量否定式限制；
+3. Gemma 直接接收 PDF 原文并生成短视频口播；
+4. 保留 debug_prompts，方便查看 Gemma 实际收到的内容；
+5. 只做最基本的输出清理。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+from openai import OpenAI
+from dotenv import load_dotenv
+
+from src.utils.logger import log_info
+
+load_dotenv()
+
+
+class NarratorTool:
+    """书籍解说生成工具"""
+
+    MIN_OUTPUT_CHARS = 50
+
+    # 这里不是限制 PDF 读取，而是避免一次发给本地模型太长导致发散。
+    # 如果你想测试更长文本，可以在 .env 里设置 NARRATOR_MAX_INPUT_CHARS=12000 或更大。
+    MAX_INPUT_CHARS = int(os.getenv("NARRATOR_MAX_INPUT_CHARS", "80000"))
+
+    def __init__(self, api_key: Optional[str] = None, style: str = "短视频"):
+        self.client = OpenAI(
+            api_key=api_key or os.getenv("API_KEY_ENV", "ollama"),
+            base_url=os.getenv("BASE_URL", "http://localhost:11434/v1"),
+        )
+        self.default_style = style
+        self.model = os.getenv("MODEL_NAME", "gemma4:e2b")
+
+    def generate(
+        self,
+        content: str,
+        title: str = "",
+        chapter_number: int = None,
+        style: str = None,
+    ) -> str:
+        """
+        根据传入的 PDF 原文生成解说词。
+        """
+        current_style = style or self.default_style
+
+        if not isinstance(content, str) or not content.strip():
+            return "生成失败：没有可用于生成的书籍文本。"
+
+        source_text = self._extract_source_text(content)
+
+        if not source_text.strip():
+            source_text = content.strip()
+
+        print("========== SOURCE_TEXT_LENGTH ==========")
+        print(len(source_text))
+
+        print("========== SOURCE_TEXT_PREVIEW ==========")
+        print(source_text[:1500])
+
+        source_text = source_text[: self.MAX_INPUT_CHARS]
+
+        prompt = self._build_prompt(
+            source_text=source_text,
+            title=title,
+            chapter_number=chapter_number,
+            style=current_style,
+        )
+
+        try:
+            raw = self._call_model(
+                prompt=prompt,
+                style=current_style,
+                task_type="first",
+            )
+
+            print("========== RAW_NARRATION ==========")
+            print(raw)
+            print("========== RAW_NARRATION_LENGTH ==========")
+            print(len(raw or ""))
+
+            result = self._clean_output(raw or "")
+
+            print("========== CLEANED_NARRATION ==========")
+            print(result)
+            print("========== CLEANED_NARRATION_LENGTH ==========")
+            print(len(result or ""))
+
+            if not result.strip():
+                return "生成失败：模型没有返回有效解说词。"
+
+            if len(result.strip()) < self.MIN_OUTPUT_CHARS:
+                return f"生成失败：模型输出过短，当前输出为：{result.strip()}"
+
+            log_info(f"第{chapter_number}章解说词生成完成，长度: {len(result)} 字符")
+
+            return result
+
+        except Exception as e:
+            return f"生成失败：{str(e)}"
+
+    # ------------------------------------------------------------------
+    # Prompt 构造
+    # ------------------------------------------------------------------
+
+    def _build_prompt(
+        self,
+        source_text: str,
+        title: str,
+        chapter_number: int,
+        style: str,
+    ) -> str:
+        title_text = self._format_title(title, chapter_number)
+
+        if style == "睡前故事":
+            return self._build_bedtime_prompt(
+                source_text=source_text,
+                title_text=title_text,
+            )
+
+        if style == "电影解说":
+            return self._build_movie_prompt(
+                source_text=source_text,
+                title_text=title_text,
+            )
+
+        # 默认短视频
+        return self._build_short_video_prompt(
+            source_text=source_text,
+            title_text=title_text,
+        )
+
+    def _build_short_video_prompt(self, source_text: str, title_text: str) -> str:
+        """
+        短视频风格：只保留简单、正向、少规则的要求。
+        """
+        return f"""
+请根据下面 PDF 原文，生成一段短视频口播风格的中文解说。
+
+书名或章节：{title_text}
+
+要求：
+1. 直接从原文人物或事件切入；
+2. 只讲原文中发生的事情，不扩展原文之外内容；
+3. 使用原文中出现的人名和事件；
+4. 语言像短视频口播，有节奏，但不要写背景音乐、镜头和栏目标题；
+5. 输出 400-800 字正文。
+
+PDF 原文：
+{source_text}
+"""
+
+    def _build_movie_prompt(self, source_text: str, title_text: str) -> str:
+        """
+        电影解说风格：同样保持简单。
+        """
+        return f"""
+请根据下面 PDF 原文，生成一段电影解说风格的中文解说。
+
+书名或章节：{title_text}
+
+要求：
+1. 直接从原文人物或事件切入；
+2. 只讲原文中发生的事情，不扩展原文之外内容；
+3. 使用原文中出现的人名和事件；
+4. 语言有画面感和叙事感，但不要写背景音乐、镜头和栏目标题；
+5. 输出 500-900 字正文。
+
+PDF 原文：
+{source_text}
+"""
+
+    def _build_bedtime_prompt(self, source_text: str, title_text: str) -> str:
+        """
+        睡前故事风格：同样保持简单。
+        """
+        return f"""
+请根据下面 PDF 原文，生成一段睡前故事风格的中文解说。
+
+书名或章节：{title_text}
+
+要求：
+1. 直接从原文人物或事件切入；
+2. 只讲原文中发生的事情，不扩展原文之外内容；
+3. 使用原文中出现的人名和事件；
+4. 语言温和、舒缓、自然，适合音频播放；
+5. 输出 500-900 字正文。
+
+PDF 原文：
+{source_text}
+"""
+
+    # ------------------------------------------------------------------
+    # Gemma 调试保存
+    # ------------------------------------------------------------------
+
+    def _save_debug_prompt(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        task_type: str = "narration",
+    ) -> None:
+        """
+        保存 Gemma 实际收到的 system prompt 和 user prompt。
+        文件位置：agent-master/debug_prompts/
+        """
+        debug_dir = Path("debug_prompts")
+        debug_dir.mkdir(exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_task_type = re.sub(r"[^\w\u4e00-\u9fff-]", "_", str(task_type))
+        file_path = debug_dir / f"{timestamp}_{safe_task_type}.txt"
+
+        content = f"""
+================ SYSTEM PROMPT ================
+
+{system_prompt}
+
+================ USER PROMPT ================
+
+{user_prompt}
+
+================ LENGTH INFO ================
+
+system_prompt_length = {len(system_prompt)}
+user_prompt_length = {len(user_prompt)}
+"""
+
+        file_path.write_text(content, encoding="utf-8")
+
+        print("========== GEMMA_DEBUG_PROMPT_SAVED ==========")
+        print(file_path.resolve())
+
+        print("========== SYSTEM_PROMPT_LENGTH ==========")
+        print(len(system_prompt))
+
+        print("========== USER_PROMPT_LENGTH ==========")
+        print(len(user_prompt))
+
+        print("========== USER_PROMPT_PREVIEW ==========")
+        print(user_prompt[:2000])
+
+    # ------------------------------------------------------------------
+    # 模型调用
+    # ------------------------------------------------------------------
+
+    def _call_model(
+        self,
+        prompt: str,
+        style: str,
+        task_type: str = "narration",
+    ) -> str:
+        """
+        调用 Gemma / OpenAI-compatible 模型。
+        """
+        if style == "睡前故事":
+            system_prompt = (
+                "你是一个书籍解说员。"
+                "请根据用户提供的 PDF 原文生成温和自然的中文解说正文。"
+                "只输出最终正文。"
+            )
+        elif style == "电影解说":
+            system_prompt = (
+                "你是一个书籍解说员。"
+                "请根据用户提供的 PDF 原文生成有画面感的中文解说正文。"
+                "只输出最终正文。"
+            )
+        else:
+            system_prompt = (
+                "你是一个短视频书籍解说口播员。"
+                "请根据用户提供的 PDF 原文生成有节奏的中文口播正文。"
+                "只输出最终正文。"
+            )
+
+        self._save_debug_prompt(
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            task_type=f"{style}_{task_type}",
+        )
+
+        kwargs = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            "temperature": 0.35 if style == "短视频" else 0.25,
+            "top_p": 0.9,
+        }
+
+        # Ollama OpenAI 兼容接口通常支持 extra_body。
+        # 如果你的环境不支持，会自动回退普通请求。
+        kwargs["extra_body"] = {
+            "options": {
+                "repeat_penalty": 1.1,
+                "num_predict": 1000,
+            }
+        }
+
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except TypeError:
+            kwargs.pop("extra_body", None)
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if "extra_body" in kwargs:
+                kwargs.pop("extra_body", None)
+                response = self.client.chat.completions.create(**kwargs)
+            else:
+                raise e
+
+        return response.choices[0].message.content or ""
+
+    # ------------------------------------------------------------------
+    # 文本提取
+    # ------------------------------------------------------------------
+
+    def _extract_source_text(self, content: str) -> str:
+        """
+        从 langchain_agent.py 拼接内容中提取真正的 PDF 原文。
+        如果匹配不到，就直接返回原内容。
+        """
+        if not isinstance(content, str):
+            return ""
+
+        patterns = [
+            r"PDF 原文内容：\s*(.*?)(?:\n请根据以上 PDF 原文内容完成用户任务。|\Z)",
+            r"PDF 指定页码范围内的原文内容：\s*(.*?)(?:\n生成要求：|\Z)",
+            r"书籍原文内容：\s*(.*?)(?:\n生成要求：|\Z)",
+            r"书籍原文片段如下：\s*(.*?)(?:\Z)",
+            r"======== PDF 内容开始 ========\s*(.*?)\s*======== PDF 内容结束 ========",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, content, re.S)
+            if match:
+                return match.group(1).strip()
+
+        return content.strip()
+
+    # ------------------------------------------------------------------
+    # 输出清理
+    # ------------------------------------------------------------------
+
+    def _clean_output(self, text: str) -> str:
+        """
+        基础清理：只去掉明显不适合前端展示的格式。
+        不再做复杂检测，避免误伤模型输出。
+        """
+        if not isinstance(text, str):
+            return ""
+
+        lines = text.splitlines()
+        cleaned_lines = []
+
+        forbidden_patterns = [
+            r"^\s*[-—]{2,}\s*$",
+            r"^\s*（?背景音乐.*?）?\s*$",
+            r"^\s*（?音乐.*?）?\s*$",
+            r"^\s*（?音效.*?）?\s*$",
+            r"^\s*（?镜头.*?）?\s*$",
+            r"^\s*（?画面.*?）?\s*$",
+            r"^\s*（?旁白.*?）?\s*$",
+            r"^\s*（?转场.*?）?\s*$",
+            r"^\s*背景音乐[:：].*$",
+            r"^\s*音乐[:：].*$",
+            r"^\s*音效[:：].*$",
+            r"^\s*镜头[:：].*$",
+            r"^\s*画面[:：].*$",
+            r"^\s*旁白[:：].*$",
+            r"^\s*\*\*?【.*?】\*\*?\s*$",
+            r"^\s*【.*?】\s*$",
+            r"^\s*#+\s*.*$",
+            r"^\s*\*+\s*$",
+        ]
+
+        for line in lines:
+            stripped = line.strip()
+
+            if not stripped:
+                cleaned_lines.append("")
+                continue
+
+            if any(re.match(pattern, stripped) for pattern in forbidden_patterns):
+                continue
+
+            stripped = stripped.replace("**", "")
+            stripped = re.sub(r"^【[^】]{1,20}】\s*", "", stripped)
+
+            cleaned_lines.append(stripped)
+
+        cleaned = "\n".join(cleaned_lines).strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+        return cleaned
+
+    def _format_title(self, title: str, chapter_number: int) -> str:
+        if title and chapter_number:
+            return f"第{chapter_number}章 {title}"
+
+        if title:
+            return title
+
+        return "未指定书名"

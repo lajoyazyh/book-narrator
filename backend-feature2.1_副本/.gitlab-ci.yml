@@ -1,0 +1,55 @@
+stages:
+  - lint
+  - test
+  - build
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .pip-cache/
+
+# ---------------------------------------------------------------------------
+# Stage 1: Lint
+# ---------------------------------------------------------------------------
+lint:
+  stage: lint
+  image: python:3.11-slim
+  before_script:
+    - pip install --quiet ruff
+  script:
+    - ruff check .
+    - ruff format --check .
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ---------------------------------------------------------------------------
+# Stage 2: Test
+# ---------------------------------------------------------------------------
+test:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - pip install --quiet -r requirements-dev.txt
+  script:
+    - pytest --tb=short -q
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ---------------------------------------------------------------------------
+# Stage 3: Build Check
+# ---------------------------------------------------------------------------
+build-check:
+  stage: build
+  image: python:3.11-slim
+  before_script:
+    - pip install --quiet -r requirements.txt
+  script:
+    - python -c "from app.main import app; print('App import OK')"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
