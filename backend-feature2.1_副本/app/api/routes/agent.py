@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from app.services.audio_service import generate_backend_audio, BACKEND_AUDIO_DIR
 from app.services.pdf_reader import (
     get_pdf_page_count,
+    get_pdf_text_by_page_range,
     detect_chapters_from_pdf,
     build_page_chunks,
     find_likely_body_start_page,
@@ -1198,18 +1199,34 @@ def create_narration_task(payload: dict, background_tasks: BackgroundTasks):
 
                 source_info = f"{pdf_path.name} 第 {start_page} 页到第 {end_page} 页"
 
-            pdf_abs_path = str(pdf_path.resolve())
-
-            user_request = build_agent_request_by_pdf_path(
-                pdf_path=pdf_abs_path,
+            # 在后端本地提取 PDF 文本，将文本内容（而非文件路径）发送给云端 Agent
+            # 这样云端 Agent 无需访问后端本地文件系统
+            max_input_chars = int(os.getenv("NARRATOR_MAX_INPUT_CHARS", "80000"))
+            pdf_text = get_pdf_text_by_page_range(
+                pdf_path=str(pdf_path.resolve()),
                 start_page=start_page,
                 end_page=end_page,
+                max_chars=max_input_chars,
+            )
+
+            if not pdf_text.strip():
+                return fail(
+                    f"PDF 指定页码范围（第 {start_page}-{end_page} 页）内没有提取到文本，"
+                    f"可能是扫描版 PDF 或页码范围不包含正文。",
+                    code=400,
+                    data={"task_id": task_id},
+                )
+
+            print("========== BACKEND_EXTRACTED_PDF_TEXT_LENGTH ==========")
+            print(len(pdf_text))
+
+            user_request = build_agent_request_by_text(
+                custom_text=pdf_text,
                 style=style,
                 voice=voice,
                 task_instruction=task_instruction,
                 source_info=source_info,
                 reading_mode=reading_mode,
-                output_language=output_language,
             )
 
         task_name = task_name_from_user or build_default_task_name(

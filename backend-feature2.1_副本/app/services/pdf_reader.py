@@ -336,3 +336,48 @@ def build_page_chunks(
         start = end + 1
 
     return chapters
+
+
+def get_pdf_text_by_page_range(
+        pdf_path: str,
+        start_page: int,
+        end_page: int,
+        max_chars: int = 80000,
+) -> str:
+    """
+    提取 PDF 指定页码范围的全部文本。
+
+    将页码范围拼接为一个完整字符串，用于发送给云端 Agent。
+    page_number 从 1 开始。
+    """
+    path = Path(pdf_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"PDF 文件不存在：{pdf_path}")
+
+    doc = fitz.open(pdf_path)
+    parts: list[str] = []
+
+    try:
+        total_pages = len(doc)
+
+        if start_page < 1:
+            start_page = 1
+
+        if end_page > total_pages:
+            end_page = total_pages
+
+        for page_index in range(start_page - 1, end_page):
+            page = doc[page_index]
+            text = page.get_text("text") or ""
+
+            if text.strip():
+                parts.append(f"[第 {page_index + 1} 页]\n{text.strip()}")
+
+                if sum(len(p) for p in parts) >= max_chars:
+                    break
+
+        return "\n\n".join(parts)
+
+    finally:
+        doc.close()
